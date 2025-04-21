@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "password"
     POSTGRES_DB: str = "fastapi"
     DATABASE_PORT: int = 5432
-    API_KEY: str
+    GROQ_API_KEY: str
 
     class Config:
         env_file = ".env"

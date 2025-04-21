@@ -1,178 +1,171 @@
-from . import schemas, models
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Annotated, List, Dict, Any
+
+from fastapi import APIRouter, Depends, HTTPException, status, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from sqlalchemy.orm import Session
-from fastapi import Depends, HTTPException, status, APIRouter, Response
-from sqlalchemy.exc import IntegrityError
+from groq import Groq
+
+from . import models, schemas
 from .database import get_db
+from .config import settings
+
+security = HTTPBearer()
+
+
+# ----------------- CONFIGURATION ------------------
+# Generate a secure random key, e.g., `openssl rand -hex 32`
+SECRET_KEY = "YOUR_SECURE_RANDOM_SECRET_KEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
 router = APIRouter()
 
-######
+# ----------------- UTILITIES ------------------
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
 
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
+def get_user(db: Session, email: str) -> Optional[models.User]:
+    return db.query(models.User).filter(models.User.email == email).first()
 
 
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
+def authenticate_user(db, email: str, password: str):
+    user = get_user(db, email)
     if not user:
         return False
     if not verify_password(password, user.hashed_password):
         return False
     return user
 
+def create_access_token(sub: str, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = {"sub": sub}
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
+    to_encode["exp"] = expire
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
-    credentials_exception = HTTPException(
+# ----------------- DEPENDENCIES ------------------
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> models.User:
+    token = credentials.credentials
+    credentials_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except InvalidTokenError:
-        raise credentials_exception
-    user = get_user(fake_users_db, username=token_data.username)
+        email: str = payload.get("sub")
+        if not email:
+            raise credentials_exc
+    except JWTError:
+        raise credentials_exc
+
+    user = get_user(db, email)
     if user is None:
-        raise credentials_exception
+        raise credentials_exc
+
     return user
 
 
-async def get_current_active_user(
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
+@router.post("/auth/signup", response_model=schemas.User)
+def signup(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = pwd_context.hash(user.password)
+    new_user = models.User(email=user.email, hashed_password=hashed_password)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
 
-
-@router.post("/token")
-async def login_for_access_token(
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-) -> Token:
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+# Login
+@router.post("/auth/login", response_model=schemas.Token)
+def login(form_data: schemas.UserLogin = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.email).first()
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
+    access_token = jwt.encode(
+        {"sub": user.email, "exp": datetime.utcnow() + access_token_expires},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
     )
-    return Token(access_token=access_token, token_type="bearer")
+    return {"access_token": access_token, "token_type": "bearer"}
 
+# List Tickets
+@router.get("/tickets", response_model=List[schemas.Ticket])
+def list_tickets(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.query(models.Ticket).filter(models.Ticket.user_id == current_user.id).all()
 
-@router.get("/users/me/", response_model=User)
-async def read_users_me(
-    current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    return current_user
+# Create Ticket
+@router.post("/tickets", response_model=schemas.Ticket)
+def create_ticket(ticket: schemas.TicketCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    new_ticket = models.Ticket(**ticket.dict(), user_id=current_user.id)
+    db.add(new_ticket)
+    db.commit()
+    db.refresh(new_ticket)
+    return new_ticket
 
+# Get Ticket Details
+@router.get("/tickets/{ticket_id}", response_model=schemas.Ticket)
+def get_ticket(ticket_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id, models.Ticket.user_id == current_user.id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return ticket
 
-@router.get("/users/me/items/")
-async def read_own_items(
-    current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    return [{"item_id": "Foo", "owner": current_user.username}]
+# Add Message to Ticket
+@router.post("/tickets/{ticket_id}/messages", response_model=schemas.MessageResponse)
+def add_message(ticket_id: int, message: schemas.MessageCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id, models.Ticket.user_id == current_user.id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    new_message = models.Message(**message.dict(), ticket_id=ticket_id, user_id=current_user.id)
+    db.add(new_message)
+    db.commit()
+    db.refresh(new_message)
+    return new_message
 
-######
+# SSE AI Response
+@router.get("/tickets/{ticket_id}/ai-response", response_model=schemas.MessageResponse)
+async def ai_response(ticket_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id, models.Ticket.user_id == current_user.id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
 
-@router.get('/')
-def get_notes(db: Session = Depends(get_db), limit: int = 10, page: int = 1, search: str = ''):
-    skip = (page - 1) * limit
+    # Prepare the conversation history
+    messages = [{"role": "user", "content": msg.content} for msg in ticket.messages]
 
-    notes = db.query(models.Note).filter(
-        models.Note.title.contains(search)).limit(limit).offset(skip).all()
-    return {'status': 'success', 'results': len(notes), 'notes': notes}
-
-
-@router.post('/', status_code=status.HTTP_201_CREATED)
-def create_note(payload: schemas.NoteBaseSchema, db: Session = Depends(get_db)):
-    new_note = models.Note(
-        title=payload.title,
-        content=payload.content,
-        category=payload.category,
-        published=payload.published
+    # Generate the AI response using Groq
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",  # Replace with your desired model
+        messages=messages,
+        stream=True
     )
 
-    db.add(new_note)
-    try:
-        db.commit()
-        db.refresh(new_note)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Note with this title already exists.")
-    
-    return {"status": "success", "note": new_note}
+    # Stream the response back to the client
+    async def event_generator():
+        async for chunk in response:
+            if chunk.choices:
+                content = chunk.choices[0].delta.get("content", "")
+                yield f"data: {content}\n\n"
+            await asyncio.sleep(0.1)
 
-
-@router.patch('/{noteId}')
-def update_note(noteId: str, payload: schemas.NotePatchSchema, db: Session = Depends(get_db)):
-    note_query = db.query(models.Note).filter(models.Note.id == noteId)
-    db_note = note_query.first()
-
-    if not db_note:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f'No note with this id: {noteId} found')
-
-    update_data = payload.model_dump(exclude_unset=True)
-
-    if 'title' in update_data:
-        existing_title = db.query(models.Note).filter(
-            models.Note.title == update_data['title'],
-            models.Note.id != noteId  
-        ).first()
-        if existing_title:
-            raise HTTPException(status_code=400, detail="Another note with this title already exists.")
-
-    note_query.update(update_data, synchronize_session=False)
-    db.commit()
-    db.refresh(db_note)
-    return {"status": "success", "note": db_note}
-
-
-@router.get('/{noteId}')
-def get_note(noteId: str, db: Session = Depends(get_db)):
-    note = db.query(models.Note).filter(models.Note.id == noteId).first()
-    if not note:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"No note with this id: {noteId} found")
-    return {"status": "success", "note": note}
-
-
-@router.delete('/{noteId}')
-def delete_note(noteId: str, db: Session = Depends(get_db)):
-    note_query = db.query(models.Note).filter(models.Note.id == noteId)
-    note = note_query.first()
-    if not note:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f'No note with this id: {noteId} found')
-    note_query.delete(synchronize_session=False)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

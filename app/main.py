@@ -27,54 +27,33 @@ app.add_middleware(
 )
 
 
-app.include_router(api.router, tags=['Notes'], prefix='/api/notes')
+app.include_router(api.router)
 
 
-@app.get("/api/healthchecker")
-def root():
-    return {"message": "Welcome to FastAPI with SQLAlchemy"}
+from fastapi.openapi.utils import get_openapi
 
-@app.get("/api/db-healthchecker")
-def db_healthchecker(db: Session = Depends(get_db)):
-    try:
-        # Attempt to execute a simple query to check database connectivity
-        db.execute("SELECT 1")
-        return {"message": "Database is healthy"}
-    except OperationalError:
-        raise HTTPException(status_code=500, detail="Database is not reachable")
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
 
-@app.get("/posts/{post_id}")
-async def get_post(post_id: int):
-    try:
-        #Make a GET request to the JSONPlaceholder API
-        response = requests.get(f"https://jsonplaceholder.typicode.com/posts/{post_id}")
-        #Check if the request was successful (status code 200)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise HTTPException(status_code=response.status_code, detail="API call failed")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Internal server error")
-    
+    openapi_schema = get_openapi(
+        title="JWT Auth Example",
+        version="1.0.0",
+        description="This is a test",
+        routes=app.routes,
+    )
 
-@app.get('/crypto-price-ethereum')
-async def get_crypto_price():
-    try:
-        api_key = os.getenv("api_key")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="API key not configured")
+    openapi_schema["components"] = openapi_schema.get("components", {})
+    openapi_schema["components"]["securitySchemes"] = {
+        "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT"
+        }
+    }
+    openapi_schema["security"] = [{"bearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
 
-        url = (
-            "https://api.coingecko.com/api/v3/simple/token_price/ethereum"
-            "?contract_addresses=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-            f"&vs_currencies=usd&x_cg_demo_api_key={api_key}"
-        )
-        response = requests.get(url)
+app.openapi = custom_openapi
 
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise HTTPException(status_code=response.status_code, detail="API call failed")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
