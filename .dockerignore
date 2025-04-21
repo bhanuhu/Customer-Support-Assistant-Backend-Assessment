@@ -1,0 +1,31 @@
+# Python bytecode files
+*.pyc
+*.pyo
+__pycache__/
+
+# Environment files
+.env
+.venv
+venv/
+env/
+
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Docker specific ignores
+Dockerfile
+docker-compose.yml
+
+# Log files
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Other common ignores
+.DS_Store
+Thumbs.db
+
